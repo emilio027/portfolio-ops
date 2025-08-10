@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       repos:
-        description: "Comma-separated owner/repo list"
+        description: "Comma-separated owner/repo list (optional)"
         required: false
         default: ""
   push:
-    branches: [main]            # run on commit to main
+    branches:
+      - main
   schedule:
-    - cron: "*/30 * * * *"      # run every 30 minutes
+    - cron: "*/30 * * * *"   # every 30 minutes
 
 permissions:
   contents: write
@@ -20,8 +21,9 @@ jobs:
   optimize:
     runs-on: ubuntu-latest
     env:
-      TOKEN: ${{ secrets.PAT }}   # your PAT secret
+      TOKEN: ${{ secrets.PAT }}     # PAT secret you added
       DEFAULT_REPOS: >-
+        emilio027/portfolio-ops,
         emilio027/Analysis-of-Financial-Instruments-in-periods-of-Hyper-Inflation,
         emilio027/Bank-Loan-Data-Analysis,
         emilio027/Time_Series_Stock_Analysis,
@@ -35,7 +37,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -43,93 +45,122 @@ jobs:
           pip install requests
 
       - name: Run optimizer script
+        shell: bash
         env:
           TARGET_REPOS: ${{ inputs.repos }}
         run: |
+          set -euo pipefail
           python - <<'PY'
-import os, base64, requests
-from urllib.parse import quote
-from datetime import datetime
+          import os, base64, requests, sys
+          from urllib.parse import quote
+          from datetime import datetime
 
-API="https://api.github.com"
-TOKEN=os.getenv("TOKEN")
-repos_str = os.getenv("TARGET_REPOS") or os.getenv("DEFAULT_REPOS","")
-REPOS=[r.strip() for r in repos_str.split(",") if r.strip()]
-BRANCH="repo-optimizer-bot"
-MSG="chore: standardize README/requirements/CI/license"
-PR_TITLE="Standardize repository documentation and CI"
-PR_BODY="Adds/refreshes README, requirements.txt, CI workflow and MIT LICENSE."
-README="# Project Title\n\nThis is a standardized README."
-REQS="pandas\nnumpy\nmatplotlib\nscikit-learn\n"
-LICENSE=f"MIT License\n\nCopyright (c) {datetime.utcnow().year}\n\n..."
-CI = """name: ci
-on: [push, pull_request]
-jobs:
-  lint-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          pip install flake8 || true
-      - name: Lint
-        run: flake8 || true
-"""
+          API = "https://api.github.com"
+          TOKEN = os.getenv("TOKEN")
+          repos_str = os.getenv("TARGET_REPOS") or os.getenv("DEFAULT_REPOS", "")
+          REPOS = [r.strip() for r in repos_str.split(",") if r.strip()]
+          BRANCH = "repo-optimizer-bot"
+          COMMIT_MSG = "chore: standardize README/requirements/CI/license"
+          PR_TITLE = "Standardize repository documentation and CI"
+          PR_BODY = "Adds/refreshes README, requirements.txt, CI workflow and MIT LICENSE."
+          README = "# Project Title\n\nThis is a standardized README."
+          REQS = "pandas\nnumpy\nmatplotlib\nscikit-learn\n"
+          LICENSE = f"MIT License\n\nCopyright (c) {datetime.utcnow().year}\n\n..."
+          CI = """name: ci
+          on: [push, pull_request]
+          jobs:
+            lint-test:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: '3.11'
+                - name: Install
+                  run: |
+                    python -m pip install --upgrade pip
+                    pip install -r requirements.txt || true
+                    pip install flake8 || true
+                - name: Lint
+                  run: flake8 || true
+          """
 
-def H(): return {"Authorization": f"Bearer {TOKEN}", "Accept":"application/vnd.github+json"}
+          def H():
+              return {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"}
 
-def get_default(repo):
-    r=requests.get(f"{API}/repos/{repo}",headers=H()); r.raise_for_status(); return r.json()["default_branch"]
+          def get_default(repo):
+              r = requests.get(f"{API}/repos/{repo}", headers=H())
+              r.raise_for_status()
+              return r.json()["default_branch"]
 
-def ref(repo, name):
-    r=requests.get(f"{API}/repos/{repo}/git/ref/heads/{name}",headers=H())
-    return r.status_code==200
+          def ref_exists(repo, name):
+              r = requests.get(f"{API}/repos/{repo}/git/ref/heads/{name}", headers=H())
+              return r.status_code == 200
 
-def mkbranch(repo, base_branch, new_branch):
-    r=requests.get(f"{API}/repos/{repo}/git/ref/heads/{base_branch}",headers=H()); r.raise_for_status()
-    sha=r.json()["object"]["sha"]
-    r=requests.post(f"{API}/repos/{repo}/git/refs",headers=H(),json={"ref":f"refs/heads/{new_branch}","sha":sha})
-    r.raise_for_status()
+          def make_branch(repo, base_branch, new_branch):
+              r = requests.get(f"{API}/repos/{repo}/git/ref/heads/{base_branch}", headers=H())
+              r.raise_for_status()
+              sha = r.json()["object"]["sha"]
+              r = requests.post(
+                  f"{API}/repos/{repo}/git/refs",
+                  headers=H(),
+                  json={"ref": f"refs/heads/{new_branch}", "sha": sha},
+              )
+              r.raise_for_status()
 
-def get_file(repo, path, branch):
-    r=requests.get(f"{API}/repos/{repo}/contents/{quote(path)}?ref={branch}",headers=H())
-    return None if r.status_code==404 else r.json()
+          def get_file(repo, path, branch):
+              r = requests.get(
+                  f"{API}/repos/{repo}/contents/{quote(path)}?ref={branch}", headers=H()
+              )
+              return None if r.status_code == 404 else r.json()
 
-def put_file(repo, path, text, branch, sha=None):
-    b64=base64.b64encode(text.encode()).decode()
-    payload={"message":MSG,"content":b64,"branch":branch}
-    if sha: payload["sha"]=sha
-    r=requests.put(f"{API}/repos/{repo}/contents/{quote(path)}",headers=H(),json=payload); r.raise_for_status()
+          def put_file(repo, path, text, branch, sha=None):
+              content_b64 = base64.b64encode(text.encode()).decode()
+              payload = {"message": COMMIT_MSG, "content": content_b64, "branch": branch}
+              if sha:
+                  payload["sha"] = sha
+              r = requests.put(
+                  f"{API}/repos/{repo}/contents/{quote(path)}", headers=H(), json=payload
+              )
+              r.raise_for_status()
 
-def ensure(repo, path, text, branch):
-    cur=get_file(repo, path, branch)
-    if cur and path.lower()=="readme.md":
-        import base64 as b64
-        try: dec=b64.b64decode(cur.get("content","")).decode()
-        except Exception: dec=""
-        if len(dec)<300: put_file(repo, path, text, branch, cur["sha"])
-    elif not cur:
-        put_file(repo, path, text, branch, None)
+          def ensure(repo, path, text, branch):
+              cur = get_file(repo, path, branch)
+              if cur:
+                  if path.lower() == "readme.md":
+                      import base64 as b64
+                      try:
+                          dec = b64.b64decode(cur.get("content", "")).decode()
+                      except Exception:
+                          dec = ""
+                      if len(dec) < 300:
+                          put_file(repo, path, text, branch, cur["sha"])
+              else:
+                  put_file(repo, path, text, branch, None)
 
-if not TOKEN:
-    raise SystemExit("Missing PAT secret (TOKEN). Add repo secret PAT.")
-if not REPOS:
-    raise SystemExit("No repos provided via inputs or DEFAULT_REPOS.")
+          if not TOKEN:
+              print("Missing PAT secret (TOKEN).")
+              sys.exit(1)
+          if not REPOS:
+              print("No repos provided via inputs or DEFAULT_REPOS.")
+              sys.exit(1)
 
-for repo in REPOS:
-    print("Processing", repo)
-    base=get_default(repo)
-    if not ref(repo, BRANCH): mkbranch(repo, base, BRANCH)
-    ensure(repo, "README.md", README, BRANCH)
-    ensure(repo, "requirements.txt", REQS, BRANCH)
-    ensure(repo, "LICENSE", LICENSE, BRANCH)
-    ensure(repo, ".github/workflows/ci.yml", CI, BRANCH)
-    r=requests.post(f"{API}/repos/{repo}/pulls",headers=H(),
-                    json={"title":PR_TITLE,"body":PR_BODY,"base":base,"head":BRANCH})
-    print("PR:", r.json().get("html_url","") if r.status_code in (200,201) else r.text)
-PY
+          for repo in REPOS:
+              print(f"Processing {repo}")
+              base_branch = get_default(repo)
+              if not ref_exists(repo, BRANCH):
+                  make_branch(repo, base_branch, BRANCH)
+              ensure(repo, "README.md", README, BRANCH)
+              ensure(repo, "requirements.txt", REQS, BRANCH)
+              ensure(repo, "LICENSE", LICENSE, BRANCH)
+              ensure(repo, ".github/workflows/ci.yml", CI, BRANCH)
+              pr = requests.post(
+                  f"{API}/repos/{repo}/pulls",
+                  headers=H(),
+                  json={"title": PR_TITLE, "body": PR_BODY, "base": base_branch, "head": BRANCH},
+              )
+              if pr.status_code in (200, 201):
+                  print("PR:", pr.json()["html_url"])
+              else:
+                  print("PR error:", pr.status_code, pr.text)
+          PY
