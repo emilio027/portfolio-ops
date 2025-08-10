@@ -8,9 +8,9 @@ on:
         required: false
         default: ""
   push:
-    branches: [main]     # <-- any commit to main will run it
+    branches: [main]            # run on commit to main
   schedule:
-    - cron: "*/30 * * * *"   # also runs every 30 minutes so you never hunt the button
+    - cron: "*/30 * * * *"      # run every 30 minutes
 
 permissions:
   contents: write
@@ -20,7 +20,7 @@ jobs:
   optimize:
     runs-on: ubuntu-latest
     env:
-      TOKEN: ${{ secrets.PAT }}     # you already added this
+      TOKEN: ${{ secrets.PAT }}   # your PAT secret
       DEFAULT_REPOS: >-
         emilio027/Analysis-of-Financial-Instruments-in-periods-of-Hyper-Inflation,
         emilio027/Bank-Loan-Data-Analysis,
@@ -28,8 +28,19 @@ jobs:
         emilio027/Microsoft-Film-Studios-Debut-Movie-Analysis-Recommendations,
         emilio027/King-s-County-Housing-Data-Linear-Regression-Analysis,
         emilio027/ai-lawfirm-dashboard
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
 
       - name: Run optimizer script
         env:
