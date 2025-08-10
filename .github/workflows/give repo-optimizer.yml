@@ -1,0 +1,47 @@
+name: repo-optimizer
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Comma-separated owner/repo list"
+        required: true
+        type: string
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write templates
+        run: |
+          cat > readme.txt << 'EOF'
+# {project_title}
+
+**Executive Summary**  
+{exec_summary}
+
+## Business Problem
+{business_problem}
+
+## Data
+- Source: {data_source}
+- Shape: {data_shape}
+- Refresh cadence: {data_refresh}
+
+## Methodology
+- Techniques: {techniques}
+- Tools: Python • SQL • {viz_tools}
+- Repro: `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python {entrypoint}`
+
+## Results & Impact
+- Key findings: {key_findings}
+- Business impact: {business_impact}
+
+## How to Run
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python {entrypoint}
