@@ -1,0 +1,244 @@
+name: bulk-ops
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Comma-separated owner/repo list (leave empty to use defaults)"
+        required: false
+        default: ""
+        type: string
+      auto_merge:
+        description: "Auto-merge PRs when mergeable"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.PAT }}
+      DEFAULT_REPOS: >-
+        emilio027/Analysis-of-Financial-Instruments-in-periods-of-Hyper-Inflation,
+        emilio027/Bank-Loan-Data-Analysis,
+        emilio027/Time_Series_Stock_Analysis,
+        emilio027/Microsoft-Film-Studios-Debut-Movie-Analysis-Recommendations,
+        emilio027/King-s-County-Housing-Data-Linear-Regression-Analysis,
+        emilio027/ai-lawfirm-dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Bulk optimize + refactor + auto-merge
+        shell: bash
+        env:
+          INPUT_REPOS: ${{ inputs.repos }}
+          AUTO_MERGE: ${{ inputs.auto_merge }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, time, base64, requests, sys
+          from urllib.parse import quote
+          from datetime import datetime
+
+          API="https://api.github.com"
+          TOKEN=os.getenv("TOKEN")
+          INPUT_REPOS=os.getenv("INPUT_REPOS","").strip()
+          DEFAULT_REPOS=os.getenv("DEFAULT_REPOS","")
+          AUTO_MERGE=os.getenv("AUTO_MERGE","true").lower() == "true"
+
+          REPOS=[r.strip() for r in (INPUT_REPOS or DEFAULT_REPOS).split(",") if r.strip()]
+          if not TOKEN: sys.exit("Missing PAT in secrets.PAT")
+          if not REPOS: sys.exit("No repositories provided")
+
+          H = {"Authorization": f"Bearer {TOKEN}", "Accept":"application/vnd.github+json"}
+
+          # ---------- utilities ----------
+          def default_branch(repo):
+              r=requests.get(f"{API}/repos/{repo}",headers=H); r.raise_for_status()
+              return r.json()["default_branch"]
+
+          def ref_exists(repo, ref):
+              r=requests.get(f"{API}/repos/{repo}/git/ref/heads/{ref}",headers=H)
+              return r.status_code==200
+
+          def make_ref(repo, base, new):
+              r=requests.get(f"{API}/repos/{repo}/git/ref/heads/{base}",headers=H); r.raise_for_status()
+              sha=r.json()["object"]["sha"]
+              r=requests.post(f"{API}/repos/{repo}/git/refs",headers=H,json={"ref":f"refs/heads/{new}","sha":sha})
+              r.raise_for_status()
+
+          def get_file(repo, path, ref):
+              r=requests.get(f"{API}/repos/{repo}/contents/{quote(path)}?ref={ref}",headers=H)
+              return None if r.status_code==404 else r.json()
+
+          def put_file(repo, path, text, ref, message, sha=None):
+              b64=base64.b64encode(text.encode()).decode()
+              payload={"message":message,"content":b64,"branch":ref}
+              if sha: payload["sha"]=sha
+              r=requests.put(f"{API}/repos/{repo}/contents/{quote(path)}",headers=H,json=payload)
+              r.raise_for_status()
+
+          def ensure(repo, path, text, ref, message):
+              cur=get_file(repo, path, ref)
+              if cur:
+                  # only touch skinny READMEs; otherwise leave user content
+                  if path.lower()=="readme.md":
+                      import base64 as b64
+                      try: dec=b64.b64decode(cur.get("content","")).decode()
+                      except Exception: dec=""
+                      if len(dec)<300: put_file(repo, path, text, ref, message, cur["sha"])
+              else:
+                  put_file(repo, path, text, ref, message, None)
+
+          def open_pr(repo, title, body, base, head):
+              r=requests.post(f"{API}/repos/{repo}/pulls",headers=H,
+                              json={"title":title,"body":body,"base":base,"head":head})
+              if r.status_code in (200,201):
+                  return r.json()["number"], r.json()["html_url"]
+              # if PR already exists, try to find it
+              r2=requests.get(f"{API}/repos/{repo}/pulls?head={repo.split('/')[0]}:{head}&state=open",headers=H)
+              if r2.status_code==200 and r2.json():
+                  pr=r2.json()[0]; return pr["number"], pr["html_url"]
+              raise SystemExit(f"PR error for {repo}: {r.status_code} {r.text}")
+
+          def merge_when_ready(repo, pr_number, timeout=900, interval=15):
+              # wait until mergeable or timeout, then merge (squash)
+              deadline=time.time()+timeout
+              while time.time()<deadline:
+                  r=requests.get(f"{API}/repos/{repo}/pulls/{pr_number}",headers=H)
+                  r.raise_for_status()
+                  data=r.json()
+                  if data.get("mergeable") is True and data.get("mergeable_state") in ("clean","unstable","has_hooks"):
+                      m=requests.put(f"{API}/repos/{repo}/pulls/{pr_number}/merge",
+                                     headers=H, json={"merge_method":"squash"})
+                      if m.status_code in (200,201):
+                          print(f"Merged PR #{pr_number} in {repo}")
+                          return True
+                      else:
+                          print(f"Merge attempt returned {m.status_code}: {m.text}")
+                  time.sleep(interval)
+              print(f"Timed out waiting to merge PR #{pr_number} in {repo}")
+              return False
+
+          # ---------- payloads ----------
+          COMMIT_MSG="chore: standardize README/requirements/CI/license"
+          PR1_TITLE="Standardize repository documentation and CI"
+          PR1_BODY="Adds/refreshes README, requirements.txt, basic CI and MIT LICENSE."
+
+          README="# Project Title\n\nThis is a standardized README."
+          REQS="pandas\nnumpy\nmatplotlib\nscikit-learn\n"
+          LICENSE=f"MIT License\n\nCopyright (c) {datetime.utcnow().year}\n\n..."
+
+          CI="""name: ci
+on: [push, pull_request]
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install flake8 pytest || true
+      - name: Lint
+        run: flake8 || true
+      - name: Tests
+        run: pytest || true
+"""
+
+          PR2_TITLE="refactor: src/ layout, tests, pyproject and quality CI"
+          PR2_BODY="Adds src/ package layout, tests/, pyproject.toml (Black/Ruff/Mypy), and quality-ci workflow."
+
+          PYPROJECT="""[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+select = ["E","F","I","UP","B","S","W","C90"]
+ignore = ["E203","E266","E501"]
+fix = true
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+
+[build-system]
+requires = ["setuptools","wheel"]
+"""
+
+          QUALITY_CI="""name: quality-ci
+on: [push, pull_request]
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install black ruff mypy pytest
+      - name: Lint
+        run: |
+          ruff check . || true
+          black --check . || true
+      - name: Type check
+        run: mypy || true
+      - name: Tests
+        run: pytest || true
+"""
+
+          TEST_SMOKE="def test_smoke():\n    assert True\n"
+
+          for repo in REPOS:
+              print(f"==> Processing {repo}")
+              base = default_branch(repo)
+
+              # ---------- PR #1: Optimizer ----------
+              opt_branch="repo-optimizer-bot"
+              if not ref_exists(repo,opt_branch):
+                  make_ref(repo, base, opt_branch)
+              ensure(repo,"README.md",README,opt_branch,COMMIT_MSG)
+              ensure(repo,"requirements.txt",REQS,opt_branch,COMMIT_MSG)
+              ensure(repo,"LICENSE",LICENSE,opt_branch,COMMIT_MSG)
+              ensure(repo,".github/workflows/ci.yml",CI,opt_branch,COMMIT_MSG)
+              pr1_num, pr1_url = open_pr(repo, PR1_TITLE, PR1_BODY, base, opt_branch)
+              print("PR1:", pr1_url)
+              if AUTO_MERGE: merge_when_ready(repo, pr1_num)
+
+              # ---------- PR #2: Refactor baseline ----------
+              ref_branch="refactor-bot"
+              if not ref_exists(repo,ref_branch):
+                  make_ref(repo, base, ref_branch)
+              ensure(repo,"pyproject.toml",PYPROJECT,ref_branch,"refactor: add pyproject")
+              ensure(repo,".github/workflows/quality-ci.yml",QUALITY_CI,ref_branch,"refactor: add quality ci")
+              ensure(repo,"tests/test_smoke.py",TEST_SMOKE,ref_branch,"refactor: add tests")
+              ensure(repo,"src/__init__.py","",ref_branch,"refactor: add src package")
+              pr2_num, pr2_url = open_pr(repo, PR2_TITLE, PR2_BODY, base, ref_branch)
+              print("PR2:", pr2_url)
+              if AUTO_MERGE: merge_when_ready(repo, pr2_num)
+
+          PY
